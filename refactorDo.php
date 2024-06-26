@@ -11,6 +11,15 @@ class GetUsers
      * @psalm-var non-empty-list<string>
      */
     private array $userIds;
+    //удалил сеттер и перенес $userIds  в конструктор,дабы не нарушалась имутабельность 
+    public function __construct(array $userIds)
+    {
+        if (empty($userIds)) {
+            throw new InvalidArgumentException('User IDs cannot be empty.');
+        }
+
+        $this->userIds = $userIds;
+    }
 
     /**
      * @psalm-return non-empty-list<string>
@@ -19,25 +28,28 @@ class GetUsers
     {
         return $this->userIds;
     }
+}
+//Добавил инерфейсы для гибкости и по SOLID'у 😃
+interface DatabaseTransactionInterface
+{
+    public function beginTransaction(string $isolationLevel): void;
+    public function commit(): void;
+    public function rollback(): void;
+}
 
-    /**
-     * @psalm-param array<string> $userIds
-     */
-    public function setUserIds(array $userIds): self
-    {
-        $this->userIds = $userIds;
+interface DatabaseQueryInterface
+{
+    public function prepare(string $query): PDOStatement;
+}
 
-        return $this;
-    }
+interface DatabaseInterface extends DatabaseTransactionInterface, DatabaseQueryInterface
+{
 }
 
 final class GetUsersHandler
 {
-    protected Database $database;
-
-    /**
-     * @param DatabaseInterface $database Some PDO wrapper
-     */
+    protected DatabaseInterface $database;
+    
     public function __construct(DatabaseInterface $database)
     {
         $this->database = $database;
@@ -48,17 +60,22 @@ final class GetUsersHandler
      */
     final public function __invoke(GetUsers $query): Generator
     {
+        //рефактор кода для удобства восприятия , вызываем функцию 
         yield from $this->transactionally(
-            static function (): iterable {
-                yield from $this
-                    ->database
-                    ->query('select id, firstname from users where id in (:ids)', [
-                        'ids' => implode(', ', $query->getUserIds()),
-                    ])
-                    ->result()
-                ;
+            function () use ($query): Generator {
+                yield from $this->fetchUsers($query);
             }
         );
+    }
+
+    private function fetchUsers(GetUsers $query): Generator
+    {
+        $ids = implode(', ', array_fill(0, count($query->getUserIds()), '?'));
+        $statement = $this->database->prepare('SELECT id, firstname FROM users WHERE id IN (' . $ids . ')');
+        $statement->execute($query->getUserIds());
+        while ($row = $statement->fetch(PDO::FETCH_ASSOC)) {
+            yield $row;
+        }
     }
 
     /**
@@ -67,14 +84,14 @@ final class GetUsersHandler
     private function transactionally(callable $operation): Generator
     {
         $this->database->beginTransaction('SERIALIZABLE');
-
+        //Перенес коммит , в трай , для правильной отработки транзакции 
         try {
             $result = $operation();
+            $this->database->commit();
         } catch (Throwable $exception) {
             $this->database->rollback();
+            throw $exception; // повторное выбрасывание исключения после отката
         }
-
-        $this->database->commit();
 
         return $result;
     }
